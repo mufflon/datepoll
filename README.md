@@ -27,7 +27,7 @@ Open http://localhost:8000. The page talks to the local Worker when served from 
 
 ## Deploy
 
-Worker:
+Worker (run from `worker/`, not the repo root; the page is served by GitHub Pages):
 
 ```sh
 cd worker
@@ -35,7 +35,7 @@ npx wrangler login
 npx wrangler deploy
 ```
 
-Put the `*.workers.dev` URL it prints into `API` at the top of `web/app.js`.
+It deploys to `https://datepoll.mufflon.workers.dev`, which is what `API` at the top of `web/app.js` points to.
 
 Site: in the GitHub repo settings, set Pages → Source to **GitHub Actions**. Every push to `main` that touches `web/` publishes it.
 

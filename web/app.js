@@ -1,10 +1,10 @@
 "use strict";
 
-// Where the Cloudflare Worker lives. Set the production URL after `wrangler deploy`.
+// Where the Cloudflare Worker (worker/) lives.
 const API =
   location.hostname === "localhost"
     ? "http://localhost:8787"
-    : "https://datepoll.REPLACE-ME.workers.dev";
+    : "https://datepoll.mufflon.workers.dev";
 
 const MAX_DATES = 60;
 const ANSWERS = [
