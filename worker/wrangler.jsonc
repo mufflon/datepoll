@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "datepoll",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-26",
+  "observability": { "enabled": true },
+  "vars": {
+    // Space-separated. Browsers on other origins can't call the API.
+    "ALLOWED_ORIGINS": "https://mufflon.github.io http://localhost:8000"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "POLLS", "class_name": "Poll" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Poll"] }]
+}
