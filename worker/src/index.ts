@@ -16,6 +16,7 @@ interface Vote {
 interface PollData {
   title: string;
   dates: string[];
+  phone: string | null;
   votes: Vote[];
   createdAt: number;
   expiresAt: number;
@@ -29,9 +30,12 @@ const MAX_TITLE = 200;
 const MAX_NAME = 60;
 const MAX_DATES = 60;
 const MAX_VOTES = 200;
+const MAX_PHONE = 30;
 const MAX_BODY = 16_384;
-// A poll deletes itself this long after its last date.
-const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+// Every poll is deleted this long after it was created; polls with a phone
+// number can pick an earlier delete-by date.
+const LIFETIME_MONTHS = 6;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const ANSWERS = new Set<unknown>(["yes", "maybe", "no"]);
 const ID_RE = /^[A-Za-z0-9_-]{22}$/;
@@ -40,7 +44,15 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // One Durable Object per poll. Votes are insert-only: there is no code path
 // that updates or deletes a single vote.
 export class Poll extends DurableObject<Env> {
-  async create(title: string, dates: string[]): Promise<PollData> {
+  private migrated = false;
+
+  async create(
+    title: string,
+    dates: string[],
+    phone: string | null,
+    createdAt: number,
+    expiresAt: number,
+  ): Promise<PollData> {
     const sql = this.ctx.storage.sql;
     sql.exec(`
       CREATE TABLE IF NOT EXISTS poll (
@@ -48,7 +60,8 @@ export class Poll extends DurableObject<Env> {
         title TEXT NOT NULL,
         dates TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        phone TEXT
       );
       CREATE TABLE IF NOT EXISTS votes (
         name TEXT PRIMARY KEY COLLATE NOCASE,
@@ -56,26 +69,25 @@ export class Poll extends DurableObject<Env> {
         created_at INTEGER NOT NULL
       );
     `);
-    const now = Date.now();
-    const lastDay = Date.parse(`${dates[dates.length - 1]}T23:59:59Z`);
-    const expiresAt = Math.max(now, lastDay) + RETENTION_MS;
     sql.exec(
-      "INSERT INTO poll (id, title, dates, created_at, expires_at) VALUES (1, ?, ?, ?, ?)",
+      "INSERT INTO poll (id, title, dates, created_at, expires_at, phone) VALUES (1, ?, ?, ?, ?, ?)",
       title,
       JSON.stringify(dates),
-      now,
+      createdAt,
       expiresAt,
+      phone,
     );
+    this.migrated = true;
     await this.ctx.storage.setAlarm(expiresAt);
     return this.read();
   }
 
   async get(): Promise<PollData | null> {
-    return this.exists() ? this.read() : null;
+    return (await this.live()) ? this.read() : null;
   }
 
   async vote(rawName: unknown, rawAnswers: unknown): Promise<VoteResult> {
-    if (!this.exists()) return { ok: false, status: 404, error: "Poll not found." };
+    if (!(await this.live())) return { ok: false, status: 404, error: "Poll not found." };
     const poll = this.read();
 
     const name = typeof rawName === "string" ? rawName.trim().replace(/\s+/g, " ") : "";
@@ -115,25 +127,43 @@ export class Poll extends DurableObject<Env> {
     return { ok: true, poll: this.read() };
   }
 
+  // Fires at the poll's expiry, whether or not anyone opens it again.
   async alarm(): Promise<void> {
     await this.ctx.storage.deleteAll();
   }
 
-  // Tables only exist once create() has run, so looking up an unknown id
-  // doesn't leave an empty object behind.
-  private exists(): boolean {
-    return (
-      this.ctx.storage.sql
-        .exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'poll'")
-        .toArray().length > 0
-    );
+  // True if the poll exists and hasn't expired. An expired poll is deleted on
+  // the spot, in case its alarm hasn't run yet.
+  private async live(): Promise<boolean> {
+    // Tables only exist once create() has run, so looking up an unknown id
+    // doesn't leave an empty object behind.
+    const sql = this.ctx.storage.sql;
+    if (sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'poll'").toArray().length === 0) {
+      return false;
+    }
+    this.migrate();
+    const p = sql.exec<{ created_at: number; expires_at: number }>("SELECT created_at, expires_at FROM poll").one();
+    // Polls created before the 6-month rule may have a later expiry.
+    if (Date.now() < Math.min(p.expires_at, addMonths(p.created_at, LIFETIME_MONTHS))) return true;
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    return false;
+  }
+
+  // Polls created before phone numbers existed lack the column.
+  private migrate(): void {
+    if (this.migrated) return;
+    const sql = this.ctx.storage.sql;
+    const columns = sql.exec<{ name: string }>("PRAGMA table_info(poll)").toArray();
+    if (!columns.some((c) => c.name === "phone")) sql.exec("ALTER TABLE poll ADD COLUMN phone TEXT");
+    this.migrated = true;
   }
 
   private read(): PollData {
     const sql = this.ctx.storage.sql;
     const p = sql
-      .exec<{ title: string; dates: string; created_at: number; expires_at: number }>(
-        "SELECT title, dates, created_at, expires_at FROM poll",
+      .exec<{ title: string; dates: string; phone: string | null; created_at: number; expires_at: number }>(
+        "SELECT title, dates, phone, created_at, expires_at FROM poll",
       )
       .one();
     const votes = sql
@@ -145,9 +175,10 @@ export class Poll extends DurableObject<Env> {
     return {
       title: p.title,
       dates: JSON.parse(p.dates),
+      phone: p.phone,
       votes,
       createdAt: p.created_at,
-      expiresAt: p.expires_at,
+      expiresAt: Math.min(p.expires_at, addMonths(p.created_at, LIFETIME_MONTHS)),
     };
   }
 }
@@ -197,7 +228,8 @@ async function route(request: Request, env: Env): Promise<[number, unknown]> {
 
   if (parts[0] !== "polls") throw new HttpError(404, "Not found.");
 
-  // POST /polls {title, dates}
+  // POST /polls {title, dates, phone?, deleteAt?}
+  // phone and deleteAt (epoch ms) come together; plain polls can't set a deleteAt.
   if (parts.length === 1 && method === "POST") {
     const body = await readJson(request);
     const title = typeof body.title === "string" ? body.title.trim() : "";
@@ -206,8 +238,25 @@ async function route(request: Request, env: Env): Promise<[number, unknown]> {
     }
     const dates = parseDates(body.dates);
     if (!dates) throw new HttpError(400, `Pick between 1 and ${MAX_DATES} valid dates.`);
+
+    const now = Date.now();
+    const maxExpiry = addMonths(now, LIFETIME_MONTHS);
+    let phone: string | null = null;
+    let expiresAt = maxExpiry;
+    if (body.phone !== undefined || body.deleteAt !== undefined) {
+      phone = parsePhone(body.phone);
+      if (!phone) throw new HttpError(400, "Enter a valid phone number.");
+      const deleteAt = body.deleteAt;
+      // A day of slack: the browser sends local midnight, which can land just
+      // past the cap across a daylight-saving change.
+      if (typeof deleteAt !== "number" || !(deleteAt > now && deleteAt <= maxExpiry + DAY_MS)) {
+        throw new HttpError(400, `Pick a delete-by date within the next ${LIFETIME_MONTHS} months.`);
+      }
+      expiresAt = Math.min(deleteAt, maxExpiry);
+    }
+
     const id = newId();
-    const poll = await env.POLLS.getByName(id).create(title, dates);
+    const poll = await env.POLLS.getByName(id).create(title, dates, phone, now, expiresAt);
     return [201, { id, poll }];
   }
 
@@ -262,6 +311,22 @@ function parseDates(value: unknown): string[] | null {
     dates.add(d);
   }
   return [...dates].sort();
+}
+
+// Digits, spaces, dashes, parentheses and an optional leading +; 6–15 digits
+// (the E.164 maximum). Returned as typed, tidied.
+function parsePhone(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const phone = value.trim().replace(/\s+/g, " ");
+  const digits = phone.replace(/\D/g, "").length;
+  const ok = /^\+?[0-9 ()-]+$/.test(phone) && phone.length <= MAX_PHONE && digits >= 6 && digits <= 15;
+  return ok ? phone : null;
+}
+
+function addMonths(ms: number, months: number): number {
+  const d = new Date(ms);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  return d.getTime();
 }
 
 // 128 random bits, base64url: 22 characters.

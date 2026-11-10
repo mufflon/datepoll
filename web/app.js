@@ -7,6 +7,8 @@ const API =
     : "https://datepoll.mufflon.workers.dev";
 
 const MAX_DATES = 60;
+// Every poll is deleted this long after it's created (enforced by the Worker).
+const LIFETIME_MONTHS = 6;
 const ANSWERS = [
   ["yes", "Yes", "✓"],
   ["maybe", "Maybe", "?"],
@@ -52,8 +54,60 @@ function renderCreate() {
   const error = h("p", { class: "error", role: "alert", hidden: true });
   const submit = h("button", { class: "primary", type: "submit", disabled: true }, "Create poll");
 
+  // Optional variant: a tap-to-call number, which requires a delete-by date.
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const lastDeleteBy = new Date();
+  lastDeleteBy.setMonth(lastDeleteBy.getMonth() + LIFETIME_MONTHS);
+  const phone = h("input", {
+    id: "phone",
+    type: "tel",
+    inputmode: "tel",
+    autocomplete: "tel",
+    maxlength: 30,
+    placeholder: "e.g. 070-123 45 67",
+  });
+  const deleteBy = h("input", { id: "delete-by", type: "date", min: toKey(tomorrow), max: toKey(lastDeleteBy) });
+  const phoneFields = h(
+    "div",
+    { class: "stack", hidden: true },
+    h(
+      "label",
+      { class: "field", for: "phone" },
+      h("span", { class: "label" }, "Phone number"),
+      phone,
+      h("span", { class: "fine" }, "Shown on the poll as a tap-to-call link. Anyone with the link can see it."),
+    ),
+    h(
+      "label",
+      { class: "field", for: "delete-by" },
+      h("span", { class: "label" }, "Delete by"),
+      deleteBy,
+      h(
+        "span",
+        { class: "fine" },
+        `The poll and the phone number are deleted at the start of this day. At most ${LIFETIME_MONTHS} months ahead.`,
+      ),
+    ),
+  );
+  const withPhone = h("input", {
+    id: "with-phone",
+    type: "checkbox",
+    onchange: () => {
+      phoneFields.hidden = !withPhone.checked;
+      if (withPhone.checked) phone.focus();
+      update();
+    },
+  });
+  const deleteByValid = () => deleteBy.value >= deleteBy.min && deleteBy.value <= deleteBy.max;
+
   function update() {
-    submit.disabled = !title.value.trim() || selected.size === 0;
+    if (phone.value.trim()) phone.setAttribute("aria-invalid", String(!validPhone(phone.value)));
+    else phone.removeAttribute("aria-invalid");
+    submit.disabled =
+      !title.value.trim() ||
+      selected.size === 0 ||
+      (withPhone.checked && (!validPhone(phone.value) || !deleteByValid()));
     chips.replaceChildren(
       ...(selected.size === 0
         ? [h("li", { class: "fine" }, "Pick one or more days in the calendar.")]
@@ -160,11 +214,13 @@ function renderCreate() {
         submit.disabled = true;
         submit.textContent = "Creating…";
         error.hidden = true;
+        const body = { title: title.value.trim(), dates: [...selected].sort() };
+        if (withPhone.checked) {
+          body.phone = phone.value.trim();
+          body.deleteAt = fromKey(deleteBy.value).getTime(); // local midnight
+        }
         try {
-          const { id } = await api("/polls", {
-            title: title.value.trim(),
-            dates: [...selected].sort(),
-          });
+          const { id } = await api("/polls", body);
           justCreated = id;
           location.hash = `#/${id}`;
         } catch (err) {
@@ -177,11 +233,15 @@ function renderCreate() {
     },
     h("label", { class: "field", for: "title" }, h("span", { class: "label" }, "Title"), title),
     h("div", { class: "field" }, h("span", { class: "label" }, "Dates"), calendar, chips),
+    h("label", { class: "check", for: "with-phone" }, withPhone, "Add a phone number people can call"),
+    phoneFields,
     error,
     h("div", { class: "actions" }, submit),
   );
 
   title.addEventListener("input", update);
+  phone.addEventListener("input", update);
+  deleteBy.addEventListener("input", update);
   app.replaceChildren(
     h("h1", {}, "New poll"),
     form,
@@ -189,7 +249,7 @@ function renderCreate() {
       "p",
       { class: "fine" },
       "No login. Anyone with the link can vote, and votes can't be changed once submitted. " +
-        "Polls delete themselves 30 days after their last date.",
+        `All polls are deleted after ${LIFETIME_MONTHS} months, or earlier if a delete-by date is set.`,
     ),
   );
   renderCalendar();
@@ -387,23 +447,34 @@ async function renderPoll(id, signal) {
     update();
   }
 
+  const deletedOn = new Date(poll.expiresAt).toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+
+  // Filtered because replaceChildren would print a null as the text "null".
   app.replaceChildren(
-    h("h1", {}, poll.title),
-    created ? h("p", { class: "notice" }, "Poll created. Share this link: anyone who has it can vote.") : null,
-    shareRow(`${location.origin}${location.pathname}#/${id}`),
-    h("h2", {}, "Results"),
-    results,
-    h("h2", {}, "Your vote"),
-    voteArea,
-    h(
-      "p",
-      { class: "fine" },
-      `This poll deletes itself on ${new Date(poll.expiresAt).toLocaleDateString(undefined, {
-        day: "numeric",
-        month: "long",
-        year: "numeric",
-      })}.`,
-    ),
+    ...[
+      h("h1", {}, poll.title),
+      poll.phone
+        ? h("p", {}, h("a", { class: "call", href: telHref(poll.phone) }, phoneIcon(), `Call ${poll.phone}`))
+        : null,
+      created ? h("p", { class: "notice" }, "Poll created. Share this link: anyone who has it can vote.") : null,
+      shareRow(`${location.origin}${location.pathname}#/${id}`),
+      h("h2", {}, "Results"),
+      results,
+      h("h2", {}, "Your vote"),
+      voteArea,
+      h(
+        "p",
+        { class: "fine" },
+        poll.phone
+          ? `All polls are deleted after ${LIFETIME_MONTHS} months, or earlier if a delete-by date is set. ` +
+              `This poll and its phone number are deleted on ${deletedOn}.`
+          : `All polls are deleted after ${LIFETIME_MONTHS} months. This one is deleted on ${deletedOn}.`,
+      ),
+    ].filter(Boolean),
   );
   renderResults();
   renderVoteArea();
@@ -497,6 +568,33 @@ const store = {
     }
   },
 };
+
+// Same rule as the Worker: digits, spaces, dashes, parentheses, optional leading +; 6–15 digits.
+function validPhone(value) {
+  const phone = value.trim();
+  const digits = phone.replace(/\D/g, "").length;
+  return /^\+?[0-9 ()-]+$/.test(phone) && phone.length <= 30 && digits >= 6 && digits <= 15;
+}
+
+// "+46 (0)70-123 45 67" → "tel:+46701234567". The (0) trunk prefix isn't dialled
+// with a country code.
+function telHref(phone) {
+  return `tel:${phone.replace(/\(0\)/g, "").replace(/[^+0-9]/g, "")}`;
+}
+
+function phoneIcon() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute(
+    "d",
+    "M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25c1.1.37 2.3.57 3.6.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1z",
+  );
+  svg.append(path);
+  return svg;
+}
 
 function toKey(d) {
   const pad = (n) => String(n).padStart(2, "0");

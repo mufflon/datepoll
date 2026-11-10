@@ -125,7 +125,9 @@ h2 {
   font-size: 0.9rem;
 }
 
-input[type="text"] {
+input[type="text"],
+input[type="tel"],
+input[type="date"] {
   width: 100%;
   font: inherit;
   color: inherit;
@@ -133,6 +135,30 @@ input[type="text"] {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 12px;
+}
+
+input[type="date"] {
+  max-width: 14em;
+}
+
+input[aria-invalid="true"] {
+  border-color: var(--error);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.check input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 button {
@@ -201,6 +227,25 @@ button:disabled {
   background: var(--yes-bg);
   border-radius: 8px;
   padding: 10px 14px;
+}
+
+.call {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+  text-decoration: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.call svg {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
 }
 
 .actions {
