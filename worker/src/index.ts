@@ -7,20 +7,34 @@ interface Env {
 
 type Answer = "yes" | "maybe" | "no";
 
+// A required drop-down every voter answers, e.g. which team they're in.
+interface Choice {
+  label: string;
+  options: string[];
+  // Pre-selected in the vote form; null means voters must pick one themselves.
+  default: string | null;
+}
+
 interface Vote {
   name: string;
   answers: Record<string, Answer>;
+  phone: string | null;
+  choice: string | null;
   createdAt: number;
 }
 
 interface PollData {
   title: string;
   dates: string[];
-  phone: string | null;
+  // Voters must leave a phone number, which everyone with the link can see.
+  collectPhones: boolean;
+  choice: Choice | null;
   votes: Vote[];
   createdAt: number;
   expiresAt: number;
 }
+
+type NewPoll = Omit<PollData, "votes">;
 
 type VoteResult =
   | { ok: true; poll: PollData }
@@ -31,9 +45,12 @@ const MAX_NAME = 60;
 const MAX_DATES = 60;
 const MAX_VOTES = 200;
 const MAX_PHONE = 30;
+const MAX_LABEL = 60;
+const MAX_OPTION = 60;
+const MAX_OPTIONS = 20;
 const MAX_BODY = 16_384;
-// Every poll is deleted this long after it was created; polls with a phone
-// number can pick an earlier delete-by date.
+// Every poll is deleted this long after it was created. Polls that collect
+// phone numbers must also set a delete-by date, at most this far ahead.
 const LIFETIME_MONTHS = 6;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -46,13 +63,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 export class Poll extends DurableObject<Env> {
   private migrated = false;
 
-  async create(
-    title: string,
-    dates: string[],
-    phone: string | null,
-    createdAt: number,
-    expiresAt: number,
-  ): Promise<PollData> {
+  async create(p: NewPoll): Promise<PollData> {
     const sql = this.ctx.storage.sql;
     sql.exec(`
       CREATE TABLE IF NOT EXISTS poll (
@@ -61,24 +72,29 @@ export class Poll extends DurableObject<Env> {
         dates TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
-        phone TEXT
+        collect_phones INTEGER NOT NULL DEFAULT 0,
+        choice TEXT
       );
       CREATE TABLE IF NOT EXISTS votes (
         name TEXT PRIMARY KEY COLLATE NOCASE,
         answers TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        phone TEXT,
+        choice TEXT
       );
     `);
     sql.exec(
-      "INSERT INTO poll (id, title, dates, created_at, expires_at, phone) VALUES (1, ?, ?, ?, ?, ?)",
-      title,
-      JSON.stringify(dates),
-      createdAt,
-      expiresAt,
-      phone,
+      `INSERT INTO poll (id, title, dates, created_at, expires_at, collect_phones, choice)
+       VALUES (1, ?, ?, ?, ?, ?, ?)`,
+      p.title,
+      JSON.stringify(p.dates),
+      p.createdAt,
+      p.expiresAt,
+      p.collectPhones ? 1 : 0,
+      p.choice ? JSON.stringify(p.choice) : null,
     );
     this.migrated = true;
-    await this.ctx.storage.setAlarm(expiresAt);
+    await this.ctx.storage.setAlarm(p.expiresAt);
     return this.read();
   }
 
@@ -86,9 +102,11 @@ export class Poll extends DurableObject<Env> {
     return (await this.live()) ? this.read() : null;
   }
 
-  async vote(rawName: unknown, rawAnswers: unknown): Promise<VoteResult> {
+  // Input comes straight from the request body, so every field is checked here.
+  async vote(input: { name: unknown; answers: unknown; phone: unknown; choice: unknown }): Promise<VoteResult> {
     if (!(await this.live())) return { ok: false, status: 404, error: "Poll not found." };
     const poll = this.read();
+    const { name: rawName, answers: rawAnswers, phone: rawPhone, choice: rawChoice } = input;
 
     const name = typeof rawName === "string" ? rawName.trim().replace(/\s+/g, " ") : "";
     if (!name || name.length > MAX_NAME) {
@@ -101,6 +119,14 @@ export class Poll extends DurableObject<Env> {
       !poll.dates.every((d) => ANSWERS.has((rawAnswers as Record<string, unknown>)[d]))
     ) {
       return { ok: false, status: 400, error: "Answer yes, maybe or no for every date." };
+    }
+    const phone = poll.collectPhones ? parsePhone(rawPhone) : null;
+    if (poll.collectPhones && !phone) {
+      return { ok: false, status: 400, error: "Enter a valid phone number." };
+    }
+    const choice = poll.choice && typeof rawChoice === "string" ? rawChoice : null;
+    if (poll.choice && !poll.choice.options.includes(choice ?? "")) {
+      return { ok: false, status: 400, error: `Pick an option for “${poll.choice.label}”.` };
     }
     if (poll.votes.length >= MAX_VOTES) {
       return { ok: false, status: 400, error: "This poll has reached its vote limit." };
@@ -119,10 +145,12 @@ export class Poll extends DurableObject<Env> {
       poll.dates.map((d) => [d, (rawAnswers as Record<string, Answer>)[d]]),
     );
     sql.exec(
-      "INSERT INTO votes (name, answers, created_at) VALUES (?, ?, ?)",
+      "INSERT INTO votes (name, answers, created_at, phone, choice) VALUES (?, ?, ?, ?, ?)",
       name,
       JSON.stringify(answers),
       Date.now(),
+      phone,
+      choice,
     );
     return { ok: true, poll: this.read() };
   }
@@ -150,32 +178,55 @@ export class Poll extends DurableObject<Env> {
     return false;
   }
 
-  // Polls created before phone numbers existed lack the column.
+  // Brings polls created by earlier versions up to the current schema.
   private migrate(): void {
     if (this.migrated) return;
     const sql = this.ctx.storage.sql;
-    const columns = sql.exec<{ name: string }>("PRAGMA table_info(poll)").toArray();
-    if (!columns.some((c) => c.name === "phone")) sql.exec("ALTER TABLE poll ADD COLUMN phone TEXT");
+    const has = (table: string, column: string) =>
+      sql
+        .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+        .toArray()
+        .some((c) => c.name === column);
+    // A short-lived version stored one phone number for the whole poll.
+    if (has("poll", "phone")) sql.exec("ALTER TABLE poll DROP COLUMN phone");
+    if (!has("poll", "collect_phones")) {
+      sql.exec("ALTER TABLE poll ADD COLUMN collect_phones INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!has("votes", "phone")) sql.exec("ALTER TABLE votes ADD COLUMN phone TEXT");
+    if (!has("poll", "choice")) sql.exec("ALTER TABLE poll ADD COLUMN choice TEXT");
+    if (!has("votes", "choice")) sql.exec("ALTER TABLE votes ADD COLUMN choice TEXT");
     this.migrated = true;
   }
 
   private read(): PollData {
     const sql = this.ctx.storage.sql;
     const p = sql
-      .exec<{ title: string; dates: string; phone: string | null; created_at: number; expires_at: number }>(
-        "SELECT title, dates, phone, created_at, expires_at FROM poll",
-      )
+      .exec<{
+        title: string;
+        dates: string;
+        collect_phones: number;
+        choice: string | null;
+        created_at: number;
+        expires_at: number;
+      }>("SELECT title, dates, collect_phones, choice, created_at, expires_at FROM poll")
       .one();
     const votes = sql
-      .exec<{ name: string; answers: string; created_at: number }>(
-        "SELECT name, answers, created_at FROM votes ORDER BY created_at, rowid",
+      .exec<{ name: string; answers: string; phone: string | null; choice: string | null; created_at: number }>(
+        "SELECT name, answers, phone, choice, created_at FROM votes ORDER BY created_at, rowid",
       )
       .toArray()
-      .map((v) => ({ name: v.name, answers: JSON.parse(v.answers), createdAt: v.created_at }));
+      .map((v) => ({
+        name: v.name,
+        answers: JSON.parse(v.answers),
+        phone: v.phone,
+        choice: v.choice,
+        createdAt: v.created_at,
+      }));
     return {
       title: p.title,
       dates: JSON.parse(p.dates),
-      phone: p.phone,
+      collectPhones: p.collect_phones === 1,
+      choice: p.choice ? JSON.parse(p.choice) : null,
       votes,
       createdAt: p.created_at,
       expiresAt: Math.min(p.expires_at, addMonths(p.created_at, LIFETIME_MONTHS)),
@@ -228,8 +279,9 @@ async function route(request: Request, env: Env): Promise<[number, unknown]> {
 
   if (parts[0] !== "polls") throw new HttpError(404, "Not found.");
 
-  // POST /polls {title, dates, phone?, deleteAt?}
-  // phone and deleteAt (epoch ms) come together; plain polls can't set a deleteAt.
+  // POST /polls {title, dates, collectPhones?, deleteAt?, choice?}
+  // collectPhones requires deleteAt (epoch ms); other polls can't set one.
+  // choice is {label, options, default?}.
   if (parts.length === 1 && method === "POST") {
     const body = await readJson(request);
     const title = typeof body.title === "string" ? body.title.trim() : "";
@@ -241,11 +293,9 @@ async function route(request: Request, env: Env): Promise<[number, unknown]> {
 
     const now = Date.now();
     const maxExpiry = addMonths(now, LIFETIME_MONTHS);
-    let phone: string | null = null;
+    const collectPhones = body.collectPhones === true;
     let expiresAt = maxExpiry;
-    if (body.phone !== undefined || body.deleteAt !== undefined) {
-      phone = parsePhone(body.phone);
-      if (!phone) throw new HttpError(400, "Enter a valid phone number.");
+    if (collectPhones) {
       const deleteAt = body.deleteAt;
       // A day of slack: the browser sends local midnight, which can land just
       // past the cap across a daylight-saving change.
@@ -253,10 +303,21 @@ async function route(request: Request, env: Env): Promise<[number, unknown]> {
         throw new HttpError(400, `Pick a delete-by date within the next ${LIFETIME_MONTHS} months.`);
       }
       expiresAt = Math.min(deleteAt, maxExpiry);
+    } else if (body.deleteAt !== undefined) {
+      throw new HttpError(400, "Only polls that collect phone numbers can set a delete-by date.");
     }
 
+    const choice = body.choice == null ? null : parseChoice(body.choice);
+
     const id = newId();
-    const poll = await env.POLLS.getByName(id).create(title, dates, phone, now, expiresAt);
+    const poll = await env.POLLS.getByName(id).create({
+      title,
+      dates,
+      collectPhones,
+      choice,
+      createdAt: now,
+      expiresAt,
+    });
     return [201, { id, poll }];
   }
 
@@ -271,10 +332,10 @@ async function route(request: Request, env: Env): Promise<[number, unknown]> {
     return [200, { poll }];
   }
 
-  // POST /polls/:id/votes {name, answers}
+  // POST /polls/:id/votes {name, answers, phone?, choice?}
   if (parts.length === 3 && parts[2] === "votes" && method === "POST") {
     const body = await readJson(request);
-    const result = await stub.vote(body.name, body.answers);
+    const result = await stub.vote({ name: body.name, answers: body.answers, phone: body.phone, choice: body.choice });
     if (!result.ok) throw new HttpError(result.status, result.error);
     return [201, { poll: result.poll }];
   }
@@ -321,6 +382,33 @@ function parsePhone(value: unknown): string | null {
   const digits = phone.replace(/\D/g, "").length;
   const ok = /^\+?[0-9 ()-]+$/.test(phone) && phone.length <= MAX_PHONE && digits >= 6 && digits <= 15;
   return ok ? phone : null;
+}
+
+// {label, options, default?}: 2–20 different options. The default, if any, must
+// be one of them.
+function parseChoice(value: unknown): Choice {
+  const v = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  const label = typeof v.label === "string" ? v.label.trim() : "";
+  if (!label || label.length > MAX_LABEL) {
+    throw new HttpError(400, `The drop-down needs a name of 1–${MAX_LABEL} characters.`);
+  }
+  const options = Array.isArray(v.options) ? v.options.map((o) => (typeof o === "string" ? o.trim() : "")) : [];
+  if (
+    options.length < 2 ||
+    options.length > MAX_OPTIONS ||
+    options.some((o) => !o || o.length > MAX_OPTION) ||
+    new Set(options.map((o) => o.toLowerCase())).size !== options.length
+  ) {
+    throw new HttpError(
+      400,
+      `The drop-down needs 2–${MAX_OPTIONS} different options of 1–${MAX_OPTION} characters each.`,
+    );
+  }
+  const fallback = v.default == null ? null : typeof v.default === "string" ? v.default.trim() : "";
+  if (fallback !== null && !options.includes(fallback)) {
+    throw new HttpError(400, "The default must be one of the options.");
+  }
+  return { label, options, default: fallback };
 }
 
 function addMonths(ms: number, months: number): number {

@@ -5,7 +5,8 @@ Find a date that works for everyone. No login, no accounts.
 - Create a poll: a title and some dates. You get a unique link.
 - Anyone with the link votes Yes, Maybe or No for each date.
 - Votes are final: once submitted, they can't be changed.
-- Optionally, add a phone number that voters can tap to call. Such a poll needs a delete-by date.
+- Optionally, add a required drop-down list (e.g. which team you're in) with its own name and options. Tick one option as the default, or leave none so every voter has to pick.
+- Optionally, ask voters for their phone number. Everyone with the link sees the numbers as tap-to-call links. Such a poll needs a delete-by date.
 - All polls are deleted 6 months after they're created, or earlier if a delete-by date is set. Plain polls can't set one.
 
 ## How it works

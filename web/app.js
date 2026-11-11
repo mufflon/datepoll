@@ -7,6 +7,7 @@ const API =
     : "https://datepoll.mufflon.workers.dev";
 
 const MAX_DATES = 60;
+const MAX_OPTIONS = 20;
 // Every poll is deleted this long after it's created (enforced by the Worker).
 const LIFETIME_MONTHS = 6;
 const ANSWERS = [
@@ -54,29 +55,20 @@ function renderCreate() {
   const error = h("p", { class: "error", role: "alert", hidden: true });
   const submit = h("button", { class: "primary", type: "submit", disabled: true }, "Create poll");
 
-  // Optional variant: a tap-to-call number, which requires a delete-by date.
+  // Optional variant: every voter leaves a phone number, which requires a delete-by date.
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   const lastDeleteBy = new Date();
   lastDeleteBy.setMonth(lastDeleteBy.getMonth() + LIFETIME_MONTHS);
-  const phone = h("input", {
-    id: "phone",
-    type: "tel",
-    inputmode: "tel",
-    autocomplete: "tel",
-    maxlength: 30,
-    placeholder: "e.g. 070-123 45 67",
-  });
   const deleteBy = h("input", { id: "delete-by", type: "date", min: toKey(tomorrow), max: toKey(lastDeleteBy) });
   const phoneFields = h(
     "div",
     { class: "stack", hidden: true },
     h(
-      "label",
-      { class: "field", for: "phone" },
-      h("span", { class: "label" }, "Phone number"),
-      phone,
-      h("span", { class: "fine" }, "Shown on the poll as a tap-to-call link. Anyone with the link can see it."),
+      "p",
+      { class: "fine", style: "margin:0" },
+      "Everyone who votes must leave a phone number. The numbers are shown in the results as tap-to-call links, " +
+        "to everyone with the link.",
     ),
     h(
       "label",
@@ -86,28 +78,40 @@ function renderCreate() {
       h(
         "span",
         { class: "fine" },
-        `The poll and the phone number are deleted at the start of this day. At most ${LIFETIME_MONTHS} months ahead.`,
+        `The poll and all phone numbers are deleted at the start of this day. At most ${LIFETIME_MONTHS} months ahead.`,
       ),
     ),
   );
-  const withPhone = h("input", {
-    id: "with-phone",
+  const collectPhones = h("input", {
+    id: "collect-phones",
     type: "checkbox",
     onchange: () => {
-      phoneFields.hidden = !withPhone.checked;
-      if (withPhone.checked) phone.focus();
+      phoneFields.hidden = !collectPhones.checked;
       update();
     },
   });
   const deleteByValid = () => deleteBy.value >= deleteBy.min && deleteBy.value <= deleteBy.max;
 
+  // Optional variant: a drop-down every voter must answer.
+  const choice = choiceEditor(() => update());
+  const addChoice = h("input", {
+    id: "add-choice",
+    type: "checkbox",
+    onchange: () => {
+      choice.el.hidden = !addChoice.checked;
+      if (addChoice.checked) choice.focus();
+      update();
+    },
+  });
+
   function update() {
-    if (phone.value.trim()) phone.setAttribute("aria-invalid", String(!validPhone(phone.value)));
-    else phone.removeAttribute("aria-invalid");
+    const choiceProblem = addChoice.checked ? choice.problem() : "";
+    choice.hint.textContent = choiceProblem;
     submit.disabled =
       !title.value.trim() ||
       selected.size === 0 ||
-      (withPhone.checked && (!validPhone(phone.value) || !deleteByValid()));
+      (collectPhones.checked && !deleteByValid()) ||
+      Boolean(choiceProblem);
     chips.replaceChildren(
       ...(selected.size === 0
         ? [h("li", { class: "fine" }, "Pick one or more days in the calendar.")]
@@ -215,10 +219,11 @@ function renderCreate() {
         submit.textContent = "Creating…";
         error.hidden = true;
         const body = { title: title.value.trim(), dates: [...selected].sort() };
-        if (withPhone.checked) {
-          body.phone = phone.value.trim();
+        if (collectPhones.checked) {
+          body.collectPhones = true;
           body.deleteAt = fromKey(deleteBy.value).getTime(); // local midnight
         }
+        if (addChoice.checked) body.choice = choice.value();
         try {
           const { id } = await api("/polls", body);
           justCreated = id;
@@ -233,14 +238,15 @@ function renderCreate() {
     },
     h("label", { class: "field", for: "title" }, h("span", { class: "label" }, "Title"), title),
     h("div", { class: "field" }, h("span", { class: "label" }, "Dates"), calendar, chips),
-    h("label", { class: "check", for: "with-phone" }, withPhone, "Add a phone number people can call"),
+    h("label", { class: "check", for: "collect-phones" }, collectPhones, "Ask voters for their phone number"),
     phoneFields,
+    h("label", { class: "check", for: "add-choice" }, addChoice, "Add a required drop-down list"),
+    choice.el,
     error,
     h("div", { class: "actions" }, submit),
   );
 
   title.addEventListener("input", update);
-  phone.addEventListener("input", update);
   deleteBy.addEventListener("input", update);
   app.replaceChildren(
     h("h1", {}, "New poll"),
@@ -255,6 +261,122 @@ function renderCreate() {
   renderCalendar();
   update();
   title.focus();
+}
+
+// Editor for the drop-down: a name and 2–20 options, at most one of them
+// ticked as the default. Blank option rows are ignored.
+function choiceEditor(onChange) {
+  const label = h("input", {
+    id: "choice-label",
+    type: "text",
+    maxlength: 60,
+    placeholder: "e.g. Team",
+    autocomplete: "off",
+    oninput: onChange,
+  });
+  const list = h("ol", { class: "options" });
+  const items = [];
+  const addButton = h(
+    "button",
+    {
+      type: "button",
+      onclick: () => {
+        addRow().text.focus();
+        onChange();
+      },
+    },
+    "Add option",
+  );
+  const hint = h("p", { class: "fine", style: "margin:0", "aria-live": "polite" });
+
+  function addRow() {
+    const item = {};
+    item.text = h("input", {
+      type: "text",
+      maxlength: 60,
+      autocomplete: "off",
+      oninput: onChange,
+      // Enter moves to the next option, adding one at the end, instead of submitting the form.
+      onkeydown: (e) => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        const next = items[items.indexOf(item) + 1] ?? (items.length < MAX_OPTIONS ? addRow() : null);
+        next?.text.focus();
+        onChange();
+      },
+    });
+    item.isDefault = h("input", {
+      type: "checkbox",
+      onchange: () => {
+        if (item.isDefault.checked) for (const other of items) if (other !== item) other.isDefault.checked = false;
+        onChange();
+      },
+    });
+    item.remove = h(
+      "button",
+      {
+        type: "button",
+        "aria-label": "Remove option",
+        onclick: () => {
+          items.splice(items.indexOf(item), 1);
+          item.row.remove();
+          refresh();
+          onChange();
+        },
+      },
+      "×",
+    );
+    item.row = h("li", {}, item.text, h("label", { class: "check" }, item.isDefault, "Default"), item.remove);
+    items.push(item);
+    list.append(item.row);
+    refresh();
+    return item;
+  }
+
+  function refresh() {
+    items.forEach((item, i) => {
+      item.text.placeholder = `Option ${i + 1}`;
+      item.text.setAttribute("aria-label", `Option ${i + 1}`);
+      item.remove.disabled = items.length <= 2;
+    });
+    addButton.disabled = items.length >= MAX_OPTIONS;
+  }
+
+  function value() {
+    const filled = items.filter((item) => item.text.value.trim());
+    return {
+      label: label.value.trim(),
+      options: filled.map((item) => item.text.value.trim()),
+      default: filled.find((item) => item.isDefault.checked)?.text.value.trim() ?? null,
+    };
+  }
+
+  // What's still missing, or "" when the drop-down is ready.
+  function problem() {
+    const v = value();
+    if (!v.label) return "Give the drop-down a name.";
+    if (v.options.length < 2) return "Add at least two options.";
+    if (new Set(v.options.map((o) => o.toLowerCase())).size !== v.options.length) {
+      return "The options must be different.";
+    }
+    return "";
+  }
+
+  addRow();
+  addRow();
+  const el = h(
+    "div",
+    { class: "stack", hidden: true },
+    h(
+      "p",
+      { class: "fine", style: "margin:0" },
+      "Every voter must pick one option. Tick Default to pre-select an option; otherwise voters have to choose.",
+    ),
+    h("label", { class: "field", for: "choice-label" }, h("span", { class: "label" }, "Name of the list"), label),
+    h("div", { class: "field" }, h("span", { class: "label" }, "Options"), list, h("div", {}, addButton)),
+    hint,
+  );
+  return { el, value, problem, hint, focus: () => label.focus() };
 }
 
 // ---------- Poll ----------
@@ -284,6 +406,11 @@ async function renderPoll(id, signal) {
   const voteArea = h("div", { class: "card" });
   const created = justCreated === id;
   justCreated = null;
+  const deletedOn = new Date(poll.expiresAt).toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
 
   function renderResults() {
     if (poll.votes.length === 0) {
@@ -301,63 +428,92 @@ async function renderPoll(id, signal) {
       { yes: 0, maybe: 0 },
     );
     const isBest = (t) => (top.yes || top.maybe) && t.yes === top.yes && t.maybe === top.maybe;
-
-    results.replaceChildren(
-      h(
-        "div",
-        { class: "table-wrap" },
-        h(
-          "table",
-          {},
-          h(
-            "thead",
-            {},
-            h(
-              "tr",
-              {},
-              h("th", { scope: "col" }, "Date"),
-              h("th", { scope: "col" }, "Total"),
-              poll.votes.map((v) =>
-                h(
-                  "th",
-                  { scope: "col", title: v.name, class: v.name.toLowerCase() === mine ? "mine" : null },
-                  v.name,
-                ),
+    const contacts = poll.collectPhones
+      ? h(
+          "ul",
+          { class: "contacts", "aria-label": "Phone numbers" },
+          poll.votes
+            .filter((v) => v.phone)
+            .map((v) =>
+              h(
+                "li",
+                {},
+                h("span", {}, v.name),
+                h("a", { class: "call", href: telHref(v.phone), "aria-label": `Call ${v.name}` }, phoneIcon(), v.phone),
               ),
             ),
-          ),
+        )
+      : null;
+
+    results.replaceChildren(
+      ...[
+        h(
+          "div",
+          { class: "table-wrap" },
           h(
-            "tbody",
+            "table",
             {},
-            poll.dates.map((d, i) =>
+            h(
+              "thead",
+              {},
               h(
                 "tr",
-                { class: isBest(tallies[i]) ? "best" : null },
-                h(
-                  "th",
-                  { scope: "row" },
-                  shortDate(d),
-                  isBest(tallies[i]) ? h("span", { class: "badge" }, "Best") : null,
-                ),
-                h(
-                  "td",
-                  {},
+                {},
+                h("th", { scope: "col" }, "Date"),
+                h("th", { scope: "col" }, "Total"),
+                poll.votes.map((v) =>
                   h(
-                    "span",
-                    { class: "tally" },
-                    h("span", { class: "t-yes", title: "Yes" }, `✓ ${tallies[i].yes}`),
-                    h("span", { class: "t-maybe", title: "Maybe" }, `? ${tallies[i].maybe}`),
+                    "th",
+                    { scope: "col", title: v.name, class: v.name.toLowerCase() === mine ? "mine" : null },
+                    v.name,
                   ),
                 ),
-                poll.votes.map((v) => {
-                  const [key, label, glyph] = ANSWERS.find(([k]) => k === v.answers[d]);
-                  return h("td", { class: `a-${key}`, title: `${v.name}: ${label}` }, glyph);
-                }),
+              ),
+              poll.choice
+                ? h(
+                    "tr",
+                    { class: "choice-row" },
+                    h("th", { scope: "row", title: poll.choice.label }, poll.choice.label),
+                    h("td"),
+                    // Votes from before the drop-down existed have no choice.
+                    poll.votes.map((v) => h("td", { title: v.choice ?? "" }, v.choice ?? "–")),
+                  )
+                : null,
+            ),
+            h(
+              "tbody",
+              {},
+              poll.dates.map((d, i) =>
+                h(
+                  "tr",
+                  { class: isBest(tallies[i]) ? "best" : null },
+                  h(
+                    "th",
+                    { scope: "row" },
+                    shortDate(d),
+                    isBest(tallies[i]) ? h("span", { class: "badge" }, "Best") : null,
+                  ),
+                  h(
+                    "td",
+                    {},
+                    h(
+                      "span",
+                      { class: "tally" },
+                      h("span", { class: "t-yes", title: "Yes" }, `✓ ${tallies[i].yes}`),
+                      h("span", { class: "t-maybe", title: "Maybe" }, `? ${tallies[i].maybe}`),
+                    ),
+                  ),
+                  poll.votes.map((v) => {
+                    const [key, label, glyph] = ANSWERS.find(([k]) => k === v.answers[d]);
+                    return h("td", { class: `a-${key}`, title: `${v.name}: ${label}` }, glyph);
+                  }),
+                ),
               ),
             ),
           ),
         ),
-      ),
+        contacts,
+      ].filter(Boolean),
     );
   }
 
@@ -373,6 +529,25 @@ async function renderPoll(id, signal) {
 
     const answers = {};
     const name = h("input", { id: "name", type: "text", maxlength: 60, autocomplete: "name" });
+    const phone = poll.collectPhones
+      ? h("input", {
+          id: "phone",
+          type: "tel",
+          inputmode: "tel",
+          autocomplete: "tel",
+          maxlength: 30,
+          placeholder: "e.g. 070-123 45 67",
+        })
+      : null;
+    // Without a default, a disabled placeholder forces an active pick.
+    const choice = poll.choice
+      ? h(
+          "select",
+          { id: "choice" },
+          poll.choice.default ? null : h("option", { value: "", disabled: true, selected: true }, "Choose…"),
+          poll.choice.options.map((o) => h("option", { value: o, selected: o === poll.choice.default }, o)),
+        )
+      : null;
     const progress = h("span", { class: "fine" });
     const error = h("p", { class: "error", role: "alert", hidden: true });
     const submit = h("button", { class: "primary", type: "submit", disabled: true }, "Submit vote");
@@ -380,7 +555,13 @@ async function renderPoll(id, signal) {
     function update() {
       const n = Object.keys(answers).length;
       progress.textContent = `${n} of ${poll.dates.length} dates answered`;
-      submit.disabled = !name.value.trim() || n < poll.dates.length;
+      if (phone?.value.trim()) phone.setAttribute("aria-invalid", String(!validPhone(phone.value)));
+      else phone?.removeAttribute("aria-invalid");
+      submit.disabled =
+        !name.value.trim() ||
+        n < poll.dates.length ||
+        (phone && !validPhone(phone.value)) ||
+        (choice && !choice.value);
     }
 
     const rows = poll.dates.map((d, i) =>
@@ -418,12 +599,27 @@ async function renderPoll(id, signal) {
         onsubmit: async (e) => {
           e.preventDefault();
           const who = name.value.trim().replace(/\s+/g, " ");
-          if (!confirm(`Submit your vote as “${who}”?\n\nVotes can't be changed afterwards.`)) return;
+          const body = { name: who, answers };
+          const details = [];
+          if (phone) {
+            body.phone = phone.value.trim();
+            details.push(`phone ${body.phone}`);
+          }
+          if (choice) {
+            body.choice = choice.value;
+            details.push(`${poll.choice.label}: ${choice.value}`);
+          }
+          const question =
+            `Submit your vote as “${who}”${details.length ? ` (${details.join(", ")})` : ""}?\n\n` +
+            (phone
+              ? "Votes can't be changed afterwards, and everyone with the link will see your number."
+              : "Votes can't be changed afterwards.");
+          if (!confirm(question)) return;
           submit.disabled = true;
           submit.textContent = "Submitting…";
           error.hidden = true;
           try {
-            ({ poll } = await api(`/polls/${encodeURIComponent(id)}/votes`, { name: who, answers }));
+            ({ poll } = await api(`/polls/${encodeURIComponent(id)}/votes`, body));
             store.set(storageKey, who);
             renderResults();
             renderVoteArea();
@@ -436,6 +632,22 @@ async function renderPoll(id, signal) {
         },
       },
       h("label", { class: "field", for: "name" }, h("span", { class: "label" }, "Your name"), name),
+      phone
+        ? h(
+            "label",
+            { class: "field", for: "phone" },
+            h("span", { class: "label" }, "Your phone number"),
+            phone,
+            h(
+              "span",
+              { class: "fine" },
+              `Everyone with the link can see and call this number until the poll is deleted on ${deletedOn}.`,
+            ),
+          )
+        : null,
+      choice
+        ? h("label", { class: "field", for: "choice" }, h("span", { class: "label" }, poll.choice.label), choice)
+        : null,
       h("div", {}, rows),
       error,
       h("div", { class: "actions" }, submit, progress),
@@ -443,23 +655,16 @@ async function renderPoll(id, signal) {
     );
 
     name.addEventListener("input", update);
+    phone?.addEventListener("input", update);
+    choice?.addEventListener("change", update);
     voteArea.replaceChildren(form);
     update();
   }
-
-  const deletedOn = new Date(poll.expiresAt).toLocaleDateString(undefined, {
-    day: "numeric",
-    month: "long",
-    year: "numeric",
-  });
 
   // Filtered because replaceChildren would print a null as the text "null".
   app.replaceChildren(
     ...[
       h("h1", {}, poll.title),
-      poll.phone
-        ? h("p", {}, h("a", { class: "call", href: telHref(poll.phone) }, phoneIcon(), `Call ${poll.phone}`))
-        : null,
       created ? h("p", { class: "notice" }, "Poll created. Share this link: anyone who has it can vote.") : null,
       shareRow(`${location.origin}${location.pathname}#/${id}`),
       h("h2", {}, "Results"),
@@ -469,9 +674,9 @@ async function renderPoll(id, signal) {
       h(
         "p",
         { class: "fine" },
-        poll.phone
+        poll.collectPhones
           ? `All polls are deleted after ${LIFETIME_MONTHS} months, or earlier if a delete-by date is set. ` +
-              `This poll and its phone number are deleted on ${deletedOn}.`
+              `This poll and everyone's phone numbers are deleted on ${deletedOn}.`
           : `All polls are deleted after ${LIFETIME_MONTHS} months. This one is deleted on ${deletedOn}.`,
       ),
     ].filter(Boolean),

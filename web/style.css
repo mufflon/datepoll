@@ -120,7 +120,8 @@ h2 {
 
 input[type="text"],
 input[type="tel"],
-input[type="date"] {
+input[type="date"],
+select {
   width: 100%;
   font: inherit;
   color: inherit;
@@ -152,6 +153,41 @@ input[aria-invalid="true"] {
   height: 18px;
   margin: 0;
   accent-color: var(--accent);
+}
+
+/* Drop-down editor */
+
+.options {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.options li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.options input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.options .check {
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.options button {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  font-size: 1.2rem;
+  line-height: 1;
 }
 
 button {
@@ -236,9 +272,39 @@ button:disabled {
 }
 
 .call svg {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
+  flex: none;
   fill: currentColor;
+}
+
+.contacts {
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 8px;
+}
+
+.contacts li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.contacts li > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contacts .call {
+  padding: 6px 14px;
+  font-size: 0.9rem;
+  white-space: nowrap;
 }
 
 .actions {
@@ -385,6 +451,14 @@ thead th {
 
 thead th.mine {
   color: var(--accent);
+}
+
+.choice-row th,
+.choice-row td {
+  font-size: 0.85rem;
+  max-width: 8em;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 th:first-child {
