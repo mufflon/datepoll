@@ -434,14 +434,15 @@ async function renderPoll(id, signal) {
           { class: "contacts", "aria-label": "Phone numbers" },
           poll.votes
             .filter((v) => v.phone)
-            .map((v) =>
-              h(
+            .map((v) => {
+              const phone = displayPhone(v.phone);
+              return h(
                 "li",
                 {},
                 h("span", {}, v.name),
-                h("a", { class: "call", href: telHref(v.phone), "aria-label": `Call ${v.name}` }, phoneIcon(), v.phone),
-              ),
-            ),
+                h("a", { class: "call", href: telHref(phone), "aria-label": `Call ${v.name}` }, phoneIcon(), phone),
+              );
+            }),
         )
       : null;
 
@@ -779,6 +780,18 @@ function validPhone(value) {
   const phone = value.trim();
   const digits = phone.replace(/\D/g, "").length;
   return /^\+?[0-9 ()-]+$/.test(phone) && phone.length <= 30 && digits >= 6 && digits <= 15;
+}
+
+// How a number is shown and dialled in the results. Votes keep exactly what the voter
+// typed; these rules only change the displayed number. The first matching rule applies.
+const PHONE_RULES = [
+  // Swedish number typed without its leading 0: "70 123 45 67" → "+46 70 123 45 67".
+  [/^7/, "+46 7"],
+];
+
+function displayPhone(phone) {
+  const rule = PHONE_RULES.find(([pattern]) => pattern.test(phone));
+  return rule ? phone.replace(...rule) : phone;
 }
 
 // "+46 (0)70-123 45 67" → "tel:+46701234567". The (0) trunk prefix isn't dialled
